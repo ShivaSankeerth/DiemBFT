@@ -1,0 +1,285 @@
+import sys
+import json
+import argparse
+
+from random import randint
+import random
+from blockTree import *
+from threading import Timer
+from leaderElection import LeaderElection
+from pacemaker import Pacemaker
+from mempool import Mempool
+from ledger import Ledger
+from safety import Safety
+from hashing import Hashing
+from nacl.encoding import HexEncoder
+from nacl.signing import SigningKey, VerifyKey
+from logging_file import LogStuff
+from config import configurations
+from testcases.config1 import test_config
+
+def override_config(config, new_test_config):
+	for k, v in new_test_config.items():
+		config[k] = v
+
+	return config
+
+
+def init_config(new_test_config):
+	LogStuff.log_to_file("Initializing new test case config")
+	config = configurations
+	config = override_config(config, new_test_config)
+	LogStuff.log_to_file("Initialized new test case config " + str(config))
+	return config
+
+class Validator(process):
+
+	def setup(node_id, validators_list, signing_key, validator_public_keys, client_public_keys, config, check_f): 
+		self.node_id = node_id
+		self.validators_list = validators_list
+		self.config = config
+
+		self.client_keys = client_public_keys
+		self.validator_keys = validator_public_keys
+
+		self.signing_key = signing_key
+		self.check_f = check_f
+		self.f_threshold = 0.99999
+
+
+	def run():
+		self.file_path = "../ledger_files/ledger_map"
+		
+
+		self.ledger = Ledger(file_path)
+		self.mempool = Mempool()
+		self.block_tree = BlockTree(0, 0, 0, self.ledger, self.mempool, self.node_id)
+
+		self.safety = Safety(self.signing_key, self.validator_keys, self.client_keys, self.block_tree, self.ledger)
+		
+
+		self.pacemaker = Pacemaker(self.block_tree, self.config)
+		self.leader_election = LeaderElection(self.validators_list, self.config['window_size'], self.config['exclude_size'], self.config['seed'], self.ledger, self.pacemaker)	
+		self.run_done = False
+
+
+		while not self.run_done or len(self.mempool.transaction_list) > 0:
+			self.round_done = False
+			if await(self.round_done == True):
+				pass
+			elif timeout(self.pacemaker.get_round_timer()):
+				if len(self.mempool.transaction_list) > 0:
+					self.local_timeout_round()
+
+	def check_if_dropped(f_bool):
+		if not f_bool:
+			return True
+		return random.random() < f_threshold
+
+
+	def receive(msg= (msgType, obj, sender_id, signature)):
+
+		if msgType == "proposal_event":
+			if check_if_dropped(self.check_f):
+				self.safety.verify_validator_signature(signature, sender_id)
+				self.process_proposal_msg(obj)
+
+		elif msgType == "vote_event":
+			if check_if_dropped(self.check_f):
+				self.safety.verify_validator_signature(signature, sender_id)
+				LogStuff.log_to_file("VERIFIED VOTE MESSAGE")
+				self.process_vote_msg(obj)
+
+		elif msgType == "timeout_event":
+			if check_if_dropped(self.check_f):
+				self.safety.verify_validator_signature(signature, sender_id)
+				self.process_timeout_msg(obj)
+
+		elif msgType == "request":
+			if check_if_dropped(self.check_f):
+				self.safety.verify_client_signature(signature, sender_id)
+				self.mempool.insert(obj)
+
+		elif msgType == 'done':
+			self.round_done = True
+			self.run_done = True
+
+	def process_certificate_qc(qc):
+		self.safety.verify_qc_signature(qc)
+		self.block_tree.process_qc(qc, self.node_id)
+		self.leader_election.update_leaders(qc)
+		self.advance_round_qc(qc)
+
+	def process_proposal_msg(P):
+		process_certificate_qc(P.block.qc)
+		process_certificate_qc(P.high_commit_qc)
+		self.advance_round_tc(P.last_round_tc)
+		round = self.pacemaker.current_round
+		leader = self.leader_election.get_leader(round)
+
+		if P.block.round != round or P.sender != leader or P.block.author != leader:
+			return
+
+		self.block_tree.execute_and_insert(P.block) # Adds a new speculative state to the Ledger
+
+		vote_msg = self.safety.make_vote(P, P.block, P.last_round_tc, self.node_id)
+		if vote_msg is not None:
+			l = self.leader_election.get_leader(round + 1)
+
+			if not check_if_dropped(check_f):
+				vote_msg.vote_info.id = -1
+			send(('vote_event', vote_msg, self.node_id, self.safety.get_signature()), to=self.validators_list[l])
+
+	def process_timeout_msg(M):
+		self.safety.verify_tc_signature(M)
+		process_certificate_qc(M.tmo_info.high_qc)
+		process_certificate_qc(M.high_commit_qc)
+		self.advance_round_tc(M.last_round_tc)
+		tc = self.process_remote_timeout(M)
+		if tc is not None:
+			self.advance_round_tc(tc)
+			process_new_round_event(tc)
+
+	def process_vote_msg(M):
+		qc = self.block_tree.process_vote(M, self.node_id, self.safety.get_signature())
+		if qc is not None:
+			process_certificate_qc(qc)
+			process_new_round_event(None)
+
+	def process_new_round_event(last_tc):
+		if len(self.mempool.transaction_list) > 0 and self.node_id == self.leader_election.get_leader(self.pacemaker.current_round):
+			# Leader code: generate proposal.
+			b = self.block_tree.generate_block(self.mempool.get_transactions(), self.pacemaker.current_round)
+			LogStuff.log_to_file_node("PROCESSING NEW ROUND EVENT",self.node_id)
+			if not check_if_dropped(check_f):
+				b.block.id = -1
+			send(('proposal_event', ProposalMsg(b, last_tc, self.block_tree.high_commit_qc, self.node_id), self.node_id, self.safety.get_signature()), to=self.validators_list)
+
+	def local_timeout_round():
+		tmo_info = self.safety.make_timeout(self.pacemaker.current_round, self.block_tree.high_qc, self.pacemaker.last_round_tc, self.node_id)
+		if not check_if_dropped(check_f):
+			tmo_info.high_qc.vote_info.id = -1
+		send(('timeout_event', TimeoutMsg(tmo_info, self.pacemaker.last_round_tc, self.block_tree.high_commit_qc), self.node_id, self.safety.get_signature()), to=self.validators_list)
+
+	def start_timer(new_round):
+		self.pacemaker.current_round = new_round
+		self.round_done = True
+		
+
+
+	def advance_round_tc(tc):
+		if tc is None or tc.round < self.pacemaker.current_round:
+			return False
+		self.pacemaker.last_round_tc = tc
+		self.start_timer(tc.round + 1)
+		return True
+
+	def advance_round_qc(qc):
+		if qc.vote_info.round < self.pacemaker.current_round:
+			return False
+		self.pacemaker.last_round_tc = None
+		self.start_timer(qc.vote_info.round + 1)
+		return True
+
+	def process_remote_timeout(timeout):
+		timeout_info = timeout.tmo_info
+		
+		if timeout_info.round < self.pacemaker.current_round:
+			return None
+			
+		if timeout_info.round not in self.pacemaker.pending_timeouts.keys():
+			self.pacemaker.pending_timeouts[timeout_info.round] = [timeout_info]
+		else:
+			tmo_senders = [t.sender for t in self.pacemaker.pending_timeouts[timeout_info.round] if t is not None]
+			if timeout_info.sender not in tmo_senders:
+				self.pacemaker.pending_timeouts[timeout_info.round].append(timeout_info)
+		
+		tmo_senders = [t.sender for t in self.pacemaker.pending_timeouts[timeout_info.round] if t is not None]
+
+		
+		if len(tmo_senders) == self.pacemaker.config['f'] + 1:
+			self.round_done = True
+			self.local_timeout_round()
+
+		if len(tmo_senders) == 2*self.pacemaker.config['f'] + 1:
+			return TC(
+				timeout_info.round,
+				[t.high_qc.vote_info.round for t in self.pacemaker.pending_timeouts[timeout_info.round]],
+				[SignatureInfo(t.sender, t.signature) for t in self.pacemaker.pending_timeouts[timeout_info.round]]
+			)
+		
+		return None
+		
+
+class Client(process):
+
+	def setup(node_id, validators_list, signing_key, validator_public_keys, config):
+		self.node_id = node_id
+		self.validators_list = validators_list
+		self.config = config
+
+		self.validator_keys = validator_public_keys
+
+		self.signing_key = signing_key
+		self.verify_key = self.signing_key.verify_key
+		self.verify_key_hex = self.verify_key.encode(encoder=HexEncoder)
+
+
+
+	def run():
+		signed_hex = self.signing_key.sign(b'Client', encoder=HexEncoder)
+		for i in range(2):
+			obj = {
+				'transaction_id' : str(self.node_id*2 + i),
+				'node_id' : self.node_id
+			}
+			send(('request', obj, self.node_id, signed_hex), to=self.validators_list)
+		for i in range(config["f"]*(config['f']+1)):
+			send(('request', {'transaction_id': '', 'node_id':self.node_id}, self.node_id, signed_hex), to=self.validators_list)
+		send(('done', {}, self.node_id, None), to=self.validators_list)
+
+
+def main():
+	
+	for new_test_config in test_config:
+		config = init_config(new_test_config)
+		num_servers = config['nReplicas']
+		num_clients = config['nClients']
+
+		clients = new(Client, num = num_clients)
+		validators = new(Validator, num= num_servers)
+
+		client_public_keys = {}
+		validator_public_keys = {}
+
+		client_private_keys = {}
+		validator_private_keys = {}
+
+		for i in range(len(validators)):
+			signing_key = SigningKey.generate()
+			verify_key = self.signing_key.verify_key
+
+			validator_public_keys[i] = verify_key
+			validator_private_keys[i] = signing_key
+
+		for i in range(len(clients)):
+			signing_key = SigningKey.generate()
+			verify_key = self.signing_key.verify_key
+
+			client_public_keys[i] = verify_key
+			client_private_keys[i] = signing_key
+
+
+		f_validators = random.sample(validators, config['f'])
+
+		
+		#Can add new variables to setup if necessary
+		LogStuff.log_to_file("Setting up validators")
+		for i, validator in enumerate(validators):
+			setup(validator, args=(i, list(validators), validator_private_keys[i], validator_public_keys, client_public_keys, config, validator in f_validators))
+
+		for i, client in enumerate(clients):
+			LogStuff.log_to_file("Setting up client"+ str(i))
+			setup(client, args=(i, list(validators), client_private_keys[i], validator_public_keys, config))
+		start(validators)
+		start(clients)
