@@ -1,6 +1,21 @@
 # Description
 
-This Project is an implementation of Diem Byzantine Fault Tolerance (DiemBFT) algorithmic core and discusses the consensus protocol which is responsible for forming agreement on ordering and finalizing transactions among a configurable set of validators.
+This Project is an implementation of Diem Byzantine Fault Tolerance (DiemBFT) algorithmic core and discusses the consensus protocol which is responsible for forming agreement on ordering and finalizing transactions among a configurable set of validators. Here's the algorithmic core of the Diem Byzantine Fault Tolerance (DiemBFT) consensus algorithm:
+
+1. Choose a random validator to be the leader for the current round.
+2. The leader proposes a block of transactions and sends it to all other validators.
+3. Each validator receives the proposed block and performs the following steps:
+   - Verify that the block is correctly formatted and includes a valid cryptographic signature from the leader.
+   - Check that the transactions in the block are valid and do not conflict with any previously processed transactions.
+   - Broadcast a "pre-vote" message to all other validators indicating that they have validated the block.
+4. Once a supermajority (two-thirds) of validators have sent pre-votes for the block, the leader sends a "pre-commit" message to all validators indicating that they should commit to the proposed block.
+5. Each validator receives the pre-commit message and performs the following steps:
+   - Verify that the message is correctly formatted and includes a valid cryptographic signature from the leader.
+   - Broadcast a "commit" message to all other validators indicating that they have committed to the block.
+6. Once a supermajority of validators have sent commit messages for the block, the block is added to the blockchain and the next round begins with a new random leader.
+
+The use of pre-votes and pre-commits in the DiemBFT algorithm is intended to prevent "last-minute" changes to the proposed block by the leader, as well as to ensure that all validators are in agreement before committing to a block. This helps to prevent attacks on the network and ensure that consensus is reached efficiently and reliably.
+
 
 
 # Platform
